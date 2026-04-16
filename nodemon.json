@@ -1,0 +1,6 @@
+{
+    "ignore": [
+        "tokens/",
+        "node_modules/"
+    ]
+}
