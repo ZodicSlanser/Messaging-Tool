@@ -1,7 +1,6 @@
 // Load .env for local dev; on cPanel env vars are set via the panel
 try { await import('dotenv/config'); } catch {}
 import express from 'express';
-import cors from 'cors';
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from 'baileys';
 import https from 'https';
 import QRCode from 'qrcode';
@@ -9,6 +8,10 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcrypt';
+import session from 'express-session';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,9 +21,36 @@ const PORT = process.env.PORT || 3000;
 const TOKENS_DIR = path.join(__dirname, 'tokens');
 const BASE_PATH = process.env.BASE_PATH || '';
 
+// Rate limiting
+const generalLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+const strictLimiter = rateLimit({ windowMs: 60_000, max: 5, standardHeaders: true, legacyHeaders: false });
+
 // Middleware
-router.use(cors());
+router.use(generalLimiter);
 router.use(express.json());
+router.use(session({
+    secret: process.env.SESSION_SECRET || 'fallback-dev-secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        maxAge: 86400000,
+        httpOnly: true,
+        secure: false,
+        sameSite: 'lax',
+    },
+}));
+
+// Auth middleware — public paths pass through, everything else requires session
+const PUBLIC_PATHS = ['/login.html', '/login.js', '/styles.css', '/api/login', '/api/auth-status'];
+router.use((req, res, next) => {
+    if (PUBLIC_PATHS.includes(req.path)) return next();
+    if (req.session && req.session.authenticated) return next();
+    if (req.path.startsWith('/api/')) {
+        return res.status(401).json({ success: false, error: 'Not authenticated' });
+    }
+    return res.redirect('login.html');
+});
+
 router.use(express.static(path.join(__dirname, 'public')));
 
 // Global state
@@ -63,6 +93,26 @@ function formatJid(number) {
     const digits = number.replace(/[^\d]/g, '');
     if (!digits || digits.length < 10) return null;
     return `${digits}@s.whatsapp.net`;
+}
+
+// Validate URL to prevent SSRF — reject private/internal addresses
+function isUrlAllowed(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+        const host = parsed.hostname.toLowerCase();
+        if (host === 'localhost' || host.endsWith('.local') || host === '[::1]') return false;
+        const parts = host.split('.').map(Number);
+        if (parts.length === 4 && parts.every(p => p >= 0 && p <= 255)) {
+            if (parts[0] === 10) return false;
+            if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+            if (parts[0] === 192 && parts[1] === 168) return false;
+            if (parts[0] === 127) return false;
+            if (parts[0] === 169 && parts[1] === 254) return false;
+            if (parts[0] === 0) return false;
+        }
+        return true;
+    } catch { return false; }
 }
 
 // Initialize Baileys client
@@ -166,8 +216,46 @@ router.get('/api/qr', (req, res) => {
     res.json({ success: true, qrCode: qrCodeData, authenticated: false });
 });
 
+// Login
+router.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    const adminUser = process.env.ADMIN_USERNAME;
+    const adminHash = process.env.ADMIN_PASSWORD_HASH;
+
+    if (!adminUser || !adminHash) {
+        console.error('ADMIN_USERNAME or ADMIN_PASSWORD_HASH not configured');
+        return res.status(500).json({ success: false, error: 'Server authentication not configured' });
+    }
+
+    if (!username || !password) {
+        return res.status(400).json({ success: false, error: 'Username and password are required' });
+    }
+
+    if (username !== adminUser) {
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+
+    try {
+        const match = await bcrypt.compare(password, adminHash);
+        if (!match) {
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+        }
+
+        req.session.authenticated = true;
+        res.json({ success: true, message: 'Login successful' });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ success: false, error: 'Login failed' });
+    }
+});
+
+// Auth status check
+router.get('/api/auth-status', (req, res) => {
+    res.json({ authenticated: req.session && req.session.authenticated === true });
+});
+
 // Restart / re-initialize connection (force fresh QR)
-router.post('/api/restart', async (req, res) => {
+router.post('/api/restart', strictLimiter, async (req, res) => {
     try {
         console.log('Restart requested...');
         if (sock) {
@@ -184,7 +272,7 @@ router.post('/api/restart', async (req, res) => {
         res.json({ success: true, message: 'Restarting connection... QR code will be available shortly.' });
     } catch (error) {
         console.error('Error restarting:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Failed to restart' });
     }
 });
 
@@ -199,6 +287,9 @@ router.post('/api/send-message', async (req, res) => {
         if (!number || !message) {
             return res.status(400).json({ success: false, error: 'Number and message are required' });
         }
+        if (message.length > 4096) {
+            return res.status(400).json({ success: false, error: 'Message too long (max 4096 characters)' });
+        }
 
         const jid = formatJid(number);
         if (!jid) {
@@ -211,7 +302,7 @@ router.post('/api/send-message', async (req, res) => {
         res.json({ success: true, message: 'Message sent successfully', data: result });
     } catch (error) {
         console.error('Error sending message:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Failed to send message' });
     }
 });
 
@@ -226,6 +317,12 @@ router.post('/api/send-image', async (req, res) => {
         if (!number || !imageUrl) {
             return res.status(400).json({ success: false, error: 'Number and imageUrl are required' });
         }
+        if (!isUrlAllowed(imageUrl)) {
+            return res.status(400).json({ success: false, error: 'Invalid image URL. Only public http/https URLs are allowed.' });
+        }
+        if (caption && caption.length > 1024) {
+            return res.status(400).json({ success: false, error: 'Caption too long (max 1024 characters)' });
+        }
 
         const jid = formatJid(number);
         if (!jid) {
@@ -238,7 +335,7 @@ router.post('/api/send-image', async (req, res) => {
         res.json({ success: true, message: 'Image sent successfully', data: result });
     } catch (error) {
         console.error('Error sending image:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Failed to send image' });
     }
 });
 
@@ -262,48 +359,43 @@ router.post('/api/check-number', async (req, res) => {
             data: {
                 numberExists: result?.exists || false,
                 id: result ? { user: result.jid?.replace('@s.whatsapp.net', '') } : null,
-                isBusiness: false,
             },
         });
     } catch (error) {
         console.error('Error checking number:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Failed to check number' });
     }
 });
 
-// Logout
-router.post('/api/logout', async (req, res) => {
+// Logout — connection.update handler handles cleanup + re-initialization on loggedOut
+router.post('/api/logout', strictLimiter, async (req, res) => {
     try {
         if (sock) {
             await sock.logout();
-            sock.end();
-            sock = null;
-            isAuthenticated = false;
-            qrCodeData = null;
-            connectionStatus = 'disconnected';
-
-            setTimeout(() => {
-                initRetryCount = 0;
-                initializeClient(true);
-            }, 2000);
         }
-
+        req.session.destroy(() => {});
         res.json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
         console.error('Error logging out:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Failed to logout' });
     }
 });
 
-// Debug: log what paths Express receives
-app.use((req, res, next) => {
-    console.log(`[DEBUG] ${req.method} ${req.originalUrl} (path: ${req.path})`);
-    next();
-});
+// Security headers
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com"],
+            imgSrc: ["'self'", "data:"],
+        },
+    },
+}));
 
-// Mount router at both base path and root to handle both cPanel Passenger and local dev
+// Mount router at base path or root
 if (BASE_PATH) app.use(BASE_PATH, router);
-app.use('/', router);
+else app.use('/', router);
 
 // Start server
 app.listen(PORT, async () => {

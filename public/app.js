@@ -65,6 +65,10 @@ function setupEventListeners() {
 async function checkStatus() {
     try {
         const response = await fetch(`${API_BASE}/status`);
+        if (response.status === 401) {
+            window.location.href = `${BASE}/login.html`;
+            return;
+        }
         const data = await response.json();
         hasConnectionError = false;
 
@@ -231,11 +235,11 @@ async function handleSendMessage(e) {
         const data = await response.json();
 
         if (data.success) {
-            showToast('success', 'Message Sent!', `Message sent to ${escapeHtml(phoneNumber)}`);
+            showToast('success', 'Message Sent!', `Message sent to ${phoneNumber}`);
             messageForm.reset();
             charCount.textContent = '0';
         } else {
-            showToast('error', 'Send Failed', escapeHtml(data.error || 'Failed to send message'));
+            showToast('error', 'Send Failed', data.error || 'Failed to send message');
         }
     } catch (error) {
         console.error('Error sending message:', error);
@@ -277,10 +281,10 @@ async function handleSendImage(e) {
         const data = await response.json();
 
         if (data.success) {
-            showToast('success', 'Image Sent!', `Image sent to ${escapeHtml(phoneNumber)}`);
+            showToast('success', 'Image Sent!', `Image sent to ${phoneNumber}`);
             imageForm.reset();
         } else {
-            showToast('error', 'Send Failed', escapeHtml(data.error || 'Failed to send image'));
+            showToast('error', 'Send Failed', data.error || 'Failed to send image');
         }
     } catch (error) {
         console.error('Error sending image:', error);
@@ -320,14 +324,13 @@ async function handleCheckNumber(e) {
 
         if (data.success) {
             const result = data.data;
-            const isValid = result.numberExists || result.canReceiveMessage;
+            const isValid = result.numberExists;
 
             checkResult.className = `check-result show ${isValid ? 'success' : 'error'}`;
             checkResult.innerHTML = `
                 <h4>${isValid ? '✓ Valid WhatsApp Number' : '✗ Invalid Number'}</h4>
                 <p><strong>Number:</strong> ${escapeHtml(result.id?.user || phoneNumber)}</p>
                 <p><strong>Status:</strong> ${result.numberExists ? 'Registered on WhatsApp' : 'Not registered'}</p>
-                ${result.isBusiness ? '<p><strong>Type:</strong> Business Account</p>' : ''}
             `;
 
             showToast(
@@ -341,7 +344,7 @@ async function handleCheckNumber(e) {
                 <h4>✗ Check Failed</h4>
                 <p>${escapeHtml(data.error || 'Unable to verify number')}</p>
             `;
-            showToast('error', 'Check Failed', escapeHtml(data.error || 'Unable to verify number'));
+            showToast('error', 'Check Failed', data.error || 'Unable to verify number');
         }
     } catch (error) {
         console.error('Error checking number:', error);
@@ -370,9 +373,7 @@ async function handleLogout() {
         const data = await response.json();
 
         if (data.success) {
-            showToast('info', 'Logged Out', 'Successfully logged out from WhatsApp');
-            showQRSection();
-            updateStatusIndicator('disconnected', 'Disconnected');
+            window.location.href = `${BASE}/login.html`;
         }
     } catch (error) {
         console.error('Error logging out:', error);
@@ -415,10 +416,10 @@ function showToast(type, title, message) {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.innerHTML = `
-        ${icons[type]}
+        ${icons[type] || ''}
         <div class="toast-content">
-            <div class="toast-title">${title}</div>
-            <div class="toast-message">${message}</div>
+            <div class="toast-title">${escapeHtml(title)}</div>
+            <div class="toast-message">${escapeHtml(message)}</div>
         </div>
     `;
 
